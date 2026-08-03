@@ -8,7 +8,7 @@ BCM GPIO wiring
 DHT11 DATA                     GPIO4
 HC-SR04 TRIG / ECHO             GPIO5 / GPIO6 (ECHO through 1 kΩ / 2 kΩ divider)
 SG90 vent servo                 GPIO12
-Active buzzer module IN         GPIO16
+Passive buzzer module IN        GPIO16
 Security alarm LED              GPIO17 through 330 Ω
 Vent-status LED                 GPIO22 through 330 Ω
 
@@ -39,12 +39,14 @@ INFLUX_PORT = 8086
 INFLUX_DATABASE = "SRH_ES_iot"
 ROOM = "room1"
 
-VENT_OPEN_TEMPERATURE = 26.0
-VENT_CLOSE_TEMPERATURE = 24.0
-PRESENCE_DISTANCE_CM = 80.0
+VENT_OPEN_TEMPERATURE = 10.0   # Open only when temperature is above 10 °C.
+VENT_CLOSE_TEMPERATURE = 10.0  # Close at 10 °C or below.
+PRESENCE_DISTANCE_CM = 5.0     # Alarm detection range: 5 cm maximum.
 PRESENCE_CONFIRMATIONS = 3
-SENSOR_INTERVAL_SECONDS = 1.0
+SENSOR_INTERVAL_SECONDS = 2.0  # DHT11 needs a slow sampling interval.
 DATABASE_INTERVAL_SECONDS = 5.0
+PASSIVE_BUZZER_FREQUENCY_HZ = 2000
+ALARM_LED_BLINK_SECONDS = 0.5
 
 # BCM GPIO numbers. Do not use physical pin numbers here.
 DHT_PIN = 4
@@ -62,7 +64,7 @@ class SystemState:
     humidity: Optional[float] = None
     distance_cm: Optional[float] = None
     vent_open: bool = False
-    mode: str = "AWAY"  # HOME or AWAY; set from MQTT dashboard topics.
+    mode: str = "HOME"  # HOME or AWAY; set from MQTT dashboard topics.
     alarm: bool = False
     presence_count: int = 0
     acknowledged: bool = False
@@ -79,6 +81,8 @@ class RoomComfortSecurityController:
         self.state = SystemState()
         self.running = True
         self.last_database_write = 0.0
+        self.last_alarm_led_toggle = 0.0
+        self.alarm_led_on = False
 
         self._setup_gpio()
         self.dht = adafruit_dht.DHT11(getattr(board, f"D{DHT_PIN}"), use_pulseio=False)
@@ -100,6 +104,8 @@ class RoomComfortSecurityController:
         GPIO.setup(VENT_STATUS_LED_PIN, GPIO.OUT, initial=GPIO.LOW)
         self.servo_pwm = GPIO.PWM(VENT_SERVO_PIN, 50)
         self.servo_pwm.start(0)
+        self.buzzer_pwm = GPIO.PWM(BUZZER_PIN, PASSIVE_BUZZER_FREQUENCY_HZ)
+        self.buzzer_pwm.start(0)
 
     def _setup_influx(self) -> Optional[InfluxDBClient]:
         try:
@@ -202,17 +208,34 @@ class RoomComfortSecurityController:
         GPIO.output(VENT_STATUS_LED_PIN, GPIO.HIGH if open_vent else GPIO.LOW)
         print(f"[VENT] {'OPEN' if open_vent else 'CLOSED'}")
 
-    @staticmethod
-    def _set_alarm_outputs(active: bool) -> None:
-        GPIO.output(SECURITY_LED_PIN, GPIO.HIGH if active else GPIO.LOW)
-        GPIO.output(BUZZER_PIN, GPIO.HIGH if active else GPIO.LOW)
+    def _set_alarm_outputs(self, active: bool) -> None:
+        """Start/stop the passive-buzzer alarm and reset the blinking LED."""
+        if active:
+            self.alarm_led_on = True
+            self.last_alarm_led_toggle = time.monotonic()
+            GPIO.output(SECURITY_LED_PIN, GPIO.HIGH)
+            self.buzzer_pwm.ChangeFrequency(PASSIVE_BUZZER_FREQUENCY_HZ)
+            self.buzzer_pwm.ChangeDutyCycle(50)
+        else:
+            self.alarm_led_on = False
+            GPIO.output(SECURITY_LED_PIN, GPIO.LOW)
+            self.buzzer_pwm.ChangeDutyCycle(0)
+
+    def _update_alarm_led_blink(self, now: float) -> None:
+        """Blink the security LED while the alarm is active."""
+        if not self.state.alarm:
+            return
+        if now - self.last_alarm_led_toggle >= ALARM_LED_BLINK_SECONDS:
+            self.alarm_led_on = not self.alarm_led_on
+            GPIO.output(SECURITY_LED_PIN, GPIO.HIGH if self.alarm_led_on else GPIO.LOW)
+            self.last_alarm_led_toggle = now
 
     # -------------------------- control logic ----------------------------
     def _update_vent_control(self) -> None:
         temperature = self.state.temperature
         if temperature is None:
             return
-        if temperature >= VENT_OPEN_TEMPERATURE:
+        if temperature > VENT_OPEN_TEMPERATURE:
             self._set_vent(True)
         elif temperature <= VENT_CLOSE_TEMPERATURE:
             self._set_vent(False)
@@ -305,6 +328,7 @@ class RoomComfortSecurityController:
             self.state.distance_cm = self._measure_distance_cm()
             self._update_vent_control()
             self._update_security_control()
+            self._update_alarm_led_blink(start)
             self._publish_and_log(start)
             time.sleep(max(0.0, SENSOR_INTERVAL_SECONDS - (time.monotonic() - start)))
 
@@ -315,6 +339,7 @@ class RoomComfortSecurityController:
             GPIO.output(VENT_STATUS_LED_PIN, GPIO.LOW)
             self._set_vent(False)
             self.servo_pwm.stop()
+            self.buzzer_pwm.stop()
             self.dht.exit()
             self.mqtt.loop_stop()
             self.mqtt.disconnect()
